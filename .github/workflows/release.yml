@@ -1,0 +1,85 @@
+name: Release
+
+# Push a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`)
+# → binaries are built and attached to a GitHub Release automatically.
+#
+# Download: https://github.com/<owner>/<repo>/releases/latest
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (glibc)
+        run: cargo build --release --locked
+
+      - name: Build (musl, fully static — runs on any Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for variant in gnu musl; do
+            if [ "$variant" = gnu ]; then
+              bin=target/release/musorter
+              name="musorter-${GITHUB_REF_NAME}-linux-x86_64"
+            else
+              bin=target/x86_64-unknown-linux-musl/release/musorter
+              name="musorter-${GITHUB_REF_NAME}-linux-x86_64-musl"
+            fi
+            stage=$(mktemp -d)
+            mkdir "$stage/$name"
+            cp "$bin" README.md "$stage/$name/"
+            tar -czf "dist/$name.tar.gz" -C "$stage" "$name"
+          done
+          ls -la dist/
+
+      - name: Smoke test
+        run: |
+          tar -xzf dist/musorter-*-linux-x86_64-musl.tar.gz -C /tmp
+          /tmp/musorter-*/musorter --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/*
+
+  release:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-linux
+          path: dist
+
+      - name: Create GitHub Release with binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/*.tar.gz
+          fi

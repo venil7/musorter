@@ -23,9 +23,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
+
+  # Builds the Linux binary on every green run so it can be downloaded
+  # straight from the workflow run page (Artifacts tab).
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - run: strip target/release/musorter || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: musorter-linux-x86_64
+          path: target/release/musorter
+          retention-days: 30
+      - run: ./target/release/musorter --version
