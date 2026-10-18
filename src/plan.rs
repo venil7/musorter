@@ -31,33 +31,95 @@ struct InRunEntry {
 pub async fn build(cfg: &Config) -> Result<Plan, AppError> {
     let (files, dirs) = scan::scan(&cfg.input)?;
 
-    // ---- metadata resolution (parallel, no disk writes) ----
-    let resolved = meta::resolve_all(&files, &cfg.overrides, cfg.jobs).await;
+    // ---- progress bar phase 1: metadata loading ----
+    let n_resolve = files
+        .iter()
+        .filter(|f| !f.symlink && matches!(f.class, FileClass::Audio | FileClass::Image))
+        .count();
+    let pb = crate::ui::progress(n_resolve as u64, "loading metadata");
 
-    // ---- Stage A1: render candidate destinations ----
+    // ---- metadata resolution (parallel, no disk writes) ----
+    let resolved = meta::resolve_all(&files, &cfg.overrides, cfg.jobs, &pb).await;
+
+    // ---- Stage A0: band/album consolidation (SPEC) ----
+    let (band_map, album_maps) = build_consolidation(&resolved);
+    // Path-only views: tags keep their own values for `--update-meta`.
+    let path_meta: Vec<Option<ResolvedMeta>> = resolved
+        .iter()
+        .map(|m| m.as_ref().map(|m| consolidated(m, &band_map, &album_maps)))
+        .collect();
+
+    // ---- Stage A1: render destinations (audio first, art aligned after) ----
     enum Rendered {
         Dst(PathBuf),
         Unprocessed(String),
         Junk,
     }
-    let mut rendered: Vec<Rendered> = Vec::with_capacity(files.len());
-    for (f, m) in files.iter().zip(resolved.iter()) {
-        let r = match f.class {
+    let mut rendered: Vec<Rendered> = files
+        .iter()
+        .map(|f| match f.class {
             FileClass::Junk => Rendered::Junk,
             FileClass::Unknown => Rendered::Unprocessed(if f.symlink {
                 "symlink".to_string()
             } else {
                 "unsupported file type".to_string()
             }),
-            FileClass::Audio | FileClass::Image => {
-                match render_one(&cfg.template, &cfg.out, f, m.as_ref()) {
-                    Ok(dst) => Rendered::Dst(dst),
-                    Err(reason) => Rendered::Unprocessed(reason),
+            // placeholders, filled by the two passes below
+            FileClass::Audio | FileClass::Image => Rendered::Unprocessed(String::new()),
+        })
+        .collect();
+
+    // pass 1: audio → dst, plus source-dir → destination-dir histogram
+    let mut audio_dirs: HashMap<PathBuf, HashMap<PathBuf, usize>> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        if f.class != FileClass::Audio {
+            continue;
+        }
+        match render_one(&cfg.template, &cfg.out, f, path_meta[i].as_ref()) {
+            Ok(dst) => {
+                if let (Some(src_dir), Some(dst_dir)) = (f.src.parent(), dst.parent()) {
+                    *audio_dirs
+                        .entry(src_dir.to_path_buf())
+                        .or_default()
+                        .entry(dst_dir.to_path_buf())
+                        .or_default() += 1;
                 }
+                rendered[i] = Rendered::Dst(dst);
             }
-        };
-        rendered.push(r);
+            Err(reason) => rendered[i] = Rendered::Unprocessed(reason),
+        }
     }
+
+    // pass 2: album art — follow its sibling audio files when possible,
+    // otherwise fall back to path inference (SPEC "album art").
+    for (i, f) in files.iter().enumerate() {
+        if f.class != FileClass::Image {
+            continue;
+        }
+        let aligned = f
+            .src
+            .parent()
+            .and_then(|d| audio_dirs.get(d))
+            .and_then(|hist| {
+                hist.iter()
+                    .max_by_key(|(dir, cnt)| {
+                        (**cnt, std::cmp::Reverse(dir.as_os_str().as_encoded_bytes()))
+                    })
+                    .map(|(dir, _)| dir.clone())
+            });
+        rendered[i] = match aligned {
+            Some(dir) => Rendered::Dst(dir.join(art_name(f))),
+            None => match render_one(&cfg.template, &cfg.out, f, path_meta[i].as_ref()) {
+                Ok(dst) => Rendered::Dst(dst),
+                Err(reason) => Rendered::Unprocessed(reason),
+            },
+        };
+    }
+
+    // ---- progress bar phase 2: planning ----
+    pb.set_position(0);
+    pb.set_length(files.len() as u64);
+    pb.set_message("planning destinations");
 
     // ---- Stage A2: disk occupancy of every relevant parent directory ----
     let mut parents: HashSet<PathBuf> = HashSet::new();
@@ -143,6 +205,7 @@ pub async fn build(cfg: &Config) -> Result<Plan, AppError> {
     };
 
     for (i, f) in files.iter().enumerate() {
+        pb.inc(1);
         let meta = resolved[i].clone();
         let (op, my_md5) = match &rendered[i] {
             Rendered::Unprocessed(reason) => (
@@ -175,6 +238,7 @@ pub async fn build(cfg: &Config) -> Result<Plan, AppError> {
 
     // The allocator's borrow of `cache` ends here.
     let hashes_computed = cache.computed();
+    pb.finish_and_clear();
 
     Ok(Plan {
         entries,
@@ -281,6 +345,79 @@ impl Allocator<'_> {
 
 /// Render the destination for one file (audio: full template; image: only the
 /// directory sections plus the original file name).
+/// Sanitized original file name for album art (kept verbatim otherwise:
+/// `folder.jpg` stays `folder.jpg`, no title-casing).
+fn art_name(f: &ScannedFile) -> String {
+    let name =
+        crate::sanitize::segment(f.src.file_name().unwrap_or_default().to_str().unwrap_or(""));
+    if name.is_empty() {
+        "_".to_string()
+    } else {
+        name
+    }
+}
+
+/// Path-only metadata: band chain + album replaced by their consolidation
+/// representatives (SPEC "album & band consolidation"). The original
+/// metadata is untouched — `--update-meta` persists each file's own values.
+fn consolidated(
+    m: &ResolvedMeta,
+    band_map: &HashMap<String, String>,
+    album_maps: &HashMap<String, HashMap<String, String>>,
+) -> ResolvedMeta {
+    let mut pm = m.clone();
+    if let Some(cur) = m.band()
+        && let Some(rep) = band_map.get(cur).filter(|r| r.as_str() != cur)
+    {
+        for k in [MetaKey::Artist, MetaKey::AlbumArtist, MetaKey::Band] {
+            if m.get(k) == Some(cur) {
+                pm.fields.insert(k, rep.clone());
+            }
+        }
+    }
+    if let Some(album) = m.get(MetaKey::Album) {
+        let bucket = pm.band().unwrap_or("").to_string();
+        if let Some(rep) = album_maps
+            .get(&bucket)
+            .and_then(|map| map.get(album))
+            .filter(|r| r.as_str() != album)
+        {
+            pm.fields.insert(MetaKey::Album, rep.clone());
+        }
+    }
+    pm
+}
+
+/// Build the band cluster (global) and album clusters (per consolidated band).
+fn build_consolidation(
+    resolved: &[Option<ResolvedMeta>],
+) -> (
+    HashMap<String, String>,
+    HashMap<String, HashMap<String, String>>,
+) {
+    let band_vals = resolved
+        .iter()
+        .flatten()
+        .filter_map(|m| m.band().map(str::to_string));
+    let band_map = crate::consolidate::cluster(band_vals);
+
+    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+    for m in resolved.iter().flatten() {
+        if let Some(album) = m.get(MetaKey::Album) {
+            let band = m
+                .band()
+                .map(|b| band_map.get(b).map(String::as_str).unwrap_or(b).to_string())
+                .unwrap_or_default();
+            buckets.entry(band).or_default().push(album.to_string());
+        }
+    }
+    let album_maps = buckets
+        .into_iter()
+        .map(|(band, albums)| (band, crate::consolidate::cluster(albums)))
+        .collect();
+    (band_map, album_maps)
+}
+
 fn render_one(
     t: &Template,
     out: &Path,
@@ -291,17 +428,7 @@ fn render_one(
         return t
             .render_dir_sections(out, f, m)
             .map_err(|_| "cannot determine album".to_string())
-            .map(|dir| {
-                let name = crate::sanitize::segment(
-                    f.src.file_name().unwrap_or_default().to_str().unwrap_or(""),
-                );
-                let name = if name.is_empty() {
-                    "_".to_string()
-                } else {
-                    name
-                };
-                dir.join(name)
-            });
+            .map(|dir| dir.join(art_name(f)));
     }
     t.render(out, f, m).map_err(|k| reason_for(k, m, f))
 }

@@ -18,10 +18,12 @@ pub fn is_asf(ext: &str) -> bool {
 }
 
 /// Resolve metadata for every scannable file, bounded by `jobs`.
+/// `progress` is incremented once per resolvable file (hidden bar = no-op).
 pub async fn resolve_all(
     files: &[ScannedFile],
     overrides: &HashMap<MetaKey, String>,
     jobs: usize,
+    progress: &indicatif::ProgressBar,
 ) -> Vec<Option<ResolvedMeta>> {
     let sem = Arc::new(Semaphore::new(jobs.max(1)));
     let mut set: JoinSet<(usize, Option<ResolvedMeta>)> = JoinSet::new();
@@ -29,6 +31,7 @@ pub async fn resolve_all(
 
     for (idx, f) in files.iter().enumerate() {
         if f.symlink || !matches!(f.class, FileClass::Audio | FileClass::Image) {
+            progress.inc(1);
             continue;
         }
         let permit = match sem.clone().acquire_owned().await {
@@ -37,10 +40,12 @@ pub async fn resolve_all(
         };
         let file = f.clone();
         let overrides = overrides.clone();
+        let progress = progress.clone();
         set.spawn(async move {
             let _permit = permit;
             let res =
                 tokio::task::spawn_blocking(move || resolve_blocking(&file, &overrides)).await;
+            progress.inc(1);
             (idx, res.unwrap_or(None))
         });
     }

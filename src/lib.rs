@@ -4,6 +4,7 @@
 //! share the exact same implementation.
 
 pub mod cli;
+pub mod consolidate;
 pub mod error;
 pub mod exec;
 pub mod hash;
@@ -15,3 +16,4 @@ pub mod report;
 pub mod sanitize;
 pub mod scan;
 pub mod template;
+pub mod ui;

@@ -754,6 +754,144 @@ fn omit_success_prints_only_failures() {
 }
 
 // ---------------------------------------------------------------------------
+// album art follows its sibling songs (bug fix: art used to re-derive its own
+// path and drifted into a folder mirroring the input structure)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn album_art_follows_sibling_songs_to_the_tag_derived_folder() {
+    let tmp = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let input = root.join("Music");
+    let out = root.join("Music1");
+    // Songs carry tags → they land in the tag-derived album folder.
+    place(
+        &fixture("tagged", "song.mp3"),
+        &input.join("SomeFolder/AlbumFolder/01 - song.mp3"),
+    );
+    std::fs::write(
+        input.join("SomeFolder/AlbumFolder/cover.jpg"),
+        b"\xFF\xD8fakejpg",
+    )
+    .unwrap();
+
+    let o = musorter(&[input.to_str().unwrap(), "--out", out.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+
+    // Art must sit NEXT TO its songs, not re-derived from its own path:
+    assert!(exists(
+        &out.join("Some Artist/1980 - Some Album/01 - Some Song.mp3")
+    ));
+    assert!(
+        exists(&out.join("Some Artist/1980 - Some Album/cover.jpg")),
+        "art did not follow its sibling songs\n{}",
+        stdout(&o)
+    );
+    assert!(
+        !exists(&out.join("SomeFolder")),
+        "art must not invent its own folder chain"
+    );
+    assert!(!input.exists());
+}
+
+// ---------------------------------------------------------------------------
+// album/band consolidation: editions of the same album share one folder
+// ---------------------------------------------------------------------------
+
+#[test]
+fn album_editions_consolidate_into_one_folder() {
+    let tmp = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let input = root.join("in");
+    let out = root.join("out");
+    place(
+        &fixture("untagged", "song.flac"),
+        &input.join("Band/Album/01 - t.flac"),
+    );
+    place(
+        &fixture("untagged", "song.m4a"),
+        &input.join("Band/Album (Japanese edition)/02 - t.m4a"),
+    );
+    place(
+        &fixture("untagged", "song.opus"),
+        &input.join("Band/Album extra/03 - t.opus"),
+    );
+    // NOT consolidated: no whitespace boundary after the shared part
+    // ("Albums" survives normalization as one word).
+    place(
+        &fixture("untagged", "song.ogg"),
+        &input.join("Band/Albums/04 - t.ogg"),
+    );
+
+    let o = musorter(&[input.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+
+    assert!(
+        exists(&out.join("Band/Album/01 - T.flac")),
+        "{}",
+        stdout(&o)
+    );
+    assert!(exists(&out.join("Band/Album/02 - T.m4a")), "{}", stdout(&o));
+    assert!(
+        exists(&out.join("Band/Album/03 - T.opus")),
+        "{}",
+        stdout(&o)
+    );
+    // `Albums` must NOT fold into `Album` (no space boundary after "Album")
+    assert!(
+        exists(&out.join("Band/Albums/04 - T.ogg")),
+        "{}",
+        stdout(&o)
+    );
+    assert!(!exists(&out.join("Band/Album (Japanese Edition)")));
+    assert!(!exists(&out.join("Band/Album extra")));
+    assert!(!input.exists());
+}
+
+// ---------------------------------------------------------------------------
+// regression: trailing ')' must survive in paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trailing_paren_survives_in_rendered_paths() {
+    let tmp = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let input = root.join("in");
+    let out = root.join("out");
+    place(
+        &fixture("untagged", "song.mp3"),
+        &input.join("Band/(1985) Great Hits (Deluxe)/01 - t.mp3"),
+    );
+
+    let o = musorter(&[input.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert!(
+        exists(&out.join("Band/1985 - Great Hits (Deluxe)/01 - T.mp3")),
+        "trailing ')' was cut off\n{}",
+        stdout(&o)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// progress bars must never leak into non-tty output (tests capture stderr)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn progress_output_absent_when_stderr_is_not_a_terminal() {
+    let tmp = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let input = root.join("in");
+    let out = root.join("out");
+    place(&fixture("tagged", "song.mp3"), &input.join("song.mp3"));
+
+    let o = musorter(&[input.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    let err = stderr(&o);
+    assert!(!err.contains("loading metadata"), "bar leaked:\n{err}");
+    assert!(!err.contains("processing files"), "bar leaked:\n{err}");
+    assert_eq!(code(&o), 0, "stderr: {err}");
+}
+
+// ---------------------------------------------------------------------------
 // md5 is computed ONLY for destination conflicts (SPEC clarification)
 // ---------------------------------------------------------------------------
 

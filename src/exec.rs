@@ -49,6 +49,23 @@ pub async fn execute(p: &Plan) -> ExecResult {
     let mut results: Vec<(usize, Result<Outcome, String>)> = Vec::new();
 
     // ---- Wave 1: independent operations, parallel & bounded ----
+    let wave1_count = p
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.op,
+                PlannedOp::Move { .. } | PlannedOp::Copy { .. } | PlannedOp::SkipIdentical { .. }
+            )
+        })
+        .count();
+    let dedup_count = p
+        .entries
+        .iter()
+        .filter(|e| matches!(e.op, PlannedOp::Dedup { .. }))
+        .count();
+    let pb = crate::ui::progress((wave1_count + dedup_count) as u64, "processing files");
+
     let sem = Arc::new(Semaphore::new(p.jobs.max(1)));
     let mut set: JoinSet<(usize, Result<Outcome, String>)> = JoinSet::new();
 
@@ -77,6 +94,7 @@ pub async fn execute(p: &Plan) -> ExecResult {
     while let Some(h) = set.join_next().await {
         if let Ok(r) = h {
             results.push(r);
+            pb.inc(1);
         }
     }
 
@@ -85,8 +103,10 @@ pub async fn execute(p: &Plan) -> ExecResult {
         if matches!(e.op, PlannedOp::Dedup { .. }) {
             let res = wave_two(e, p).await;
             results.push((i, res));
+            pb.inc(1);
         }
     }
+    pb.finish_and_clear();
 
     // ---- Pruning (move mode only) ----
     let prune = if !p.copy_mode && !p.dry_run {

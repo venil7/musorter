@@ -122,9 +122,12 @@ fn split_yearish(dir: &str) -> Option<(String, String)> {
 }
 
 /// Strip leading/trailing separator noise from an album remainder.
+/// Strip separator noise from a year-dir remainder. Only `-`/`_`/space are
+/// separator noise — brackets and parens are *content* (`(Deluxe)` must
+/// survive; bug fix: a trailing `)` used to be cut off).
 fn strip_sep(s: &str) -> String {
     s.trim()
-        .trim_matches(|c| matches!(c, '-' | '_' | ' ' | '[' | ']' | '(' | ')'))
+        .trim_matches(|c| matches!(c, '-' | '_' | ' '))
         .trim()
         .to_string()
 }
@@ -222,5 +225,22 @@ mod tests {
         assert_eq!(split_yearish("Greatest Hits"), None);
         assert_eq!(split_yearish("19851"), None);
         assert_eq!(split_yearish("1985x"), None);
+    }
+
+    #[test]
+    fn trailing_paren_is_content_not_noise() {
+        // regression: a trailing `)` must never be cut off (SPEC bug report)
+        assert_eq!(
+            split_yearish("(1985) Great Hits (Deluxe)"),
+            Some(("1985".into(), "Great Hits (Deluxe)".into()))
+        );
+        assert_eq!(
+            split_yearish("1985 - Live (Deluxe Edition)"),
+            Some(("1985".into(), "Live (Deluxe Edition)".into()))
+        );
+        assert_eq!(
+            split_yearish("1985 - [Remastered]"),
+            Some(("1985".into(), "[Remastered]".into()))
+        );
     }
 }

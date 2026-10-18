@@ -26,6 +26,7 @@ phase-by-phase algorithms, concurrency model, test strategy, milestones.
 | `tokio` (`rt-multi-thread`, `macros`) | 1.x | runtime; all blocking FS/tag/hash work goes through `spawn_blocking` behind a bounded semaphore |
 | `lofty` | **0.25.4** | tag read+write: AAC, AIFF, APE, FLAC, MP3, MP4/M4A, MPC, Opus, Ogg Vorbis, Speex, WAV, WavPack (verified: actively maintained, edition 2024) |
 | `walkdir` | 2.x | input scan (no symlink following) |
+| `indicatif` | latest | the two stderr progress bars (map building + execution); hidden automatically when stderr is not a terminal |
 | `md-5` | 0.10.x | md5 checksums (SPEC-mandated), `hex` 0.4 for formatting |
 | `thiserror` | 2.x | typed errors; `anyhow` only at `main()` boundary |
 | `tempfile` | dev | integration-test sandboxes |
@@ -270,27 +271,57 @@ through the template using path-inferred meta, then append the original
 applies to `Band`/`Album` as usual (`Title` isn't used for images);
 if band/album can't be inferred → `Unprocessed { "cannot determine album" }`.
 
-### P5 — conflict detection, lazy hashing, dedup, allocation
+### P5 — consolidation, rendering, conflict detection, lazy hashing, allocation
 
 **md5 is computed only for files involved in a destination conflict** (SPEC
 clarification): a file whose rendered destination is free (and shares its
 destination key with no other input) is moved/copied **without ever being
-hashed**. The phase runs in three deterministic stages over entries sorted by
-`rel` (byte order of components):
+hashed**. The phase runs in deterministic stages over entries sorted by `rel`
+(byte order of components). The whole phase is covered by progress-bar
+phase 1/2 (see §11a).
 
-**Stage A — conflict detection (serial, cheap: stats only, no file reads):**
-1. Render every entry (P4) → candidate `dst`.
-2. Group entries by destination key = `lowercased(dst)` (case-insensitive-
-   aware: `Cover.jpg`/`cover.jpg` collide). Groups with **>1 member** are an
-   *input conflict* — all members will need md5 (step 3).
-3. For each unique destination key, probe the existing output tree along the
-   suffix chain `base`, `base-1`, `base-2`, … **stat only** until the first
-   free slot; record `(idx, path, size)` for existing candidates. A
-   candidate whose **size differs** from every same-chain source is already
-   known to be a different file — **no md5 needed** for that comparison. A
-   candidate with size equal to a source that may be compared against it
-   marks both (source + destination file) for hashing.
-4. Output of stage A: the set of paths to hash (conflict participants only).
+**Stage A0 — band/album consolidation (SPEC "album & band consolidation"):**
+after metadata resolution, cluster the resolved values:
+
+- `cluster(values)`: unique values sorted by (byte-length, bytes); each value
+  is claimed by the first (⇒ shortest) established representative `r` with
+  `v.starts_with(r) && (v.len() == r.len() || v[r.len()] == ' ')`; values
+  with no match become representatives themselves. O(n·m) over small unique
+  sets, fully deterministic, order-independent by construction.
+- bands cluster globally; albums cluster **per consolidated band** (bucket
+  key = the file's post-consolidation `$band`, `""` when absent).
+- rendering uses a **path-only clone** of the metadata with the band-chain
+  fields / `Album` replaced by their representatives; `PlanEntry.meta`
+  keeps the original values so `--update-meta` never erases editions.
+
+**Stage A1 — render destinations (two passes):**
+1. **Audio** entries render the full template → candidate `dst`.
+2. **Album art** (`FileClass::Image`): if its *source directory* contains
+   audio entries that rendered successfully, the image goes to the **most
+   common audio destination directory** in that folder (ties broken
+   lexicographically) + its sanitized original name — art always lands
+   beside its sibling songs even when those were placed from tags (bug fix:
+   path-inferred art used to drift into a folder mirroring the input
+   structure, e.g. `out/Music/Band/…`). Otherwise fall back to rendering the
+   template's directory sections from the image's own path-inferred
+   metadata (`cannot determine album` when that fails).
+3. `Unknown` → `unsupported file type` / `symlink`; `Junk` → no destination.
+
+**Stage A2 — disk occupancy (serial, cheap):** for every unique rendered
+parent directory, `read_dir` once → map of `lowercased(full path) → (path,
+size)`. This makes occupancy lookups case-insensitive-aware on every
+platform (`Cover.jpg`/`cover.jpg` collide on Linux too) without walking the
+whole output tree.
+
+**Stage A3 — conflict detection (serial, stats only, no file reads):**
+1. Group rendered entries by destination key = `lowercased(dst)`. Groups
+   with **>1 member** are an *input conflict* — all members will need md5.
+2. For each group, probe the suffix chain `base`, `base-1`, `base-2`, …
+   **stat only** until the first free slot (stage-A2 records for anything in
+   an occupied parent). A candidate whose **size differs** from a source is
+   provably a different file — **no md5 needed**; a candidate with size
+   equal to a source marks both (source + destination file) for hashing.
+3. Output: the set of paths to hash (conflict participants only).
 
 **Stage B — hashing (parallel):** chunked md5 (64 KiB) for exactly the stage-A
 set, inputs and existing destination files alike, via `spawn_blocking` under
@@ -318,8 +349,8 @@ Probe outcomes:
 
 Group leader = first member allocated to a given destination in sorted order;
 all later same-md5 members become `Dedup`/`SkipIdentical` as above.
-4. Plan is now complete. Nothing on disk has been modified, and in the
-   common case (no conflicts) **zero bytes were hashed**.
+Plan is now complete. Nothing on disk has been modified, and in the
+common case (no conflicts) **zero bytes were hashed**.
 
 Idempotency follows: same inputs + same existing-output state ⇒ same plan;
 second run after a successful run has an empty input ⇒ empty plan.
@@ -327,10 +358,13 @@ second run after a successful run has an empty input ⇒ empty plan.
 ## 7. Execution (`exec.rs`)
 
 - `Semaphore::new(jobs)` + `JoinSet`; each task handles one entry via
-  `spawn_blocking` (std fs, never async fs — batched blocking is thetokio
+  `spawn_blocking` (std fs, never async fs — batched blocking is the tokio
   guidance). Results collected as `Vec<(idx, Result<ActionLine, FileError>)>`,
   then sorted by `idx` ⇒ report order is deterministic regardless of
   scheduling.
+- **Progress bar 2** covers the whole execute() call: length = wave-1
+  runnable entries + wave-2 dedups, incremented as results come in,
+  `finish_and_clear()` before the report is written (see §11a).
 - **`update-meta` step (audio only, processed files only)**:
   - **move mode**: write tags on the *source* path immediately before the
     move; a write failure ⇒ `FileError`, file left byte-identical as-is,
@@ -447,6 +481,19 @@ else 0.
 
 ## 11. Concurrency & determinism
 
+### 11a. Progress indication (SPEC "progress indication")
+
+- `indicatif` bars drawn on **stderr** only when stderr is a terminal
+  (`std::io::IsTerminal`); otherwise `ProgressBar::hidden()` — tests, pipes
+  and redirected logs never see progress bytes.
+- **Bar 1 (map building)** lives in `plan::build()`:
+  phase 1 `loading metadata` (length = number of resolvable files,
+  incremented by `resolve_all` tasks), then phase 2 `planning destinations`
+  (position reset, length = all files, incremented in the allocation loop),
+  `finish_and_clear()` when the plan is ready.
+- **Bar 2 (execution)** lives in `exec::execute()` as described in §7.
+- Shared helper `ui::progress(len, msg)` centralizes the TTY check + style.
+
 - Single tokio multi-thread runtime; `--jobs` semaphore bounds *all* blocking
   work (tag read, hashing, copy/move). Default = `available_parallelism()`.
 - Plan-building phases are parallel *per file* but produce indexed results;
@@ -485,7 +532,12 @@ else 0.
 - `sanitize`: reserved names, 150-char UTF-8 truncation, `<>:"/\|?*`,
   trailing dots, non-ASCII.
 - `infer`: the SPEC folder examples, `01 - Title`, `1985 - Live` year dirs,
-  shallow trees (no album/artist ancestor).
+  shallow trees (no album/artist ancestor), and **trailing-paren preservation**
+  (`(1985) Great Hits (Deluxe)` ⇒ album keeps `(Deluxe)` — `strip_sep` bug
+  fix: only `-`/`_`/space are separator noise, brackets are content).
+- `consolidate`: the SPEC grouping examples (`album`/`album (Japanese
+  edition)`/`album extra` ⇒ `album`; `abc`/`abc whatever` ⇒ `abc`;
+  `abc` vs `abcde` stay distinct), chain/order independence.
 - `plan`: dedup leadership, suffix allocation incl. case-insensitive keys,
   existing-dest same/different md5.
 - `asf`: byte-level fixtures for both descriptor objects.
@@ -496,6 +548,11 @@ sandbox via `tempfile`):
   generated once with ffmpeg (`tests/gen_fixtures.sh`, committed, <100 KB
   total) and tagged in-test via lofty/asf writer.
 - e2e move run: assert exact output tree + report lines + exit 0 + input gone.
+- **consolidation e2e**: `Band/Album/…` + `Band/Album (Japanese edition)/…`
+  both render into `out/Band/Album/`.
+- **album-art alignment e2e**: tagged song + `cover.jpg` side by side ⇒ both
+  land in the tag-derived album directory (art no longer re-derives its own
+  path); art-only folders still fall back to path inference.
 - dry-run: snapshot equality (names, sizes, mtimes, hashes).
 - copy mode: source tree intact, no dirs pruned.
 - conflicts: pre-seeded dest with different bytes ⇒ `-1` suffix; identical

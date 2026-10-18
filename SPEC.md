@@ -159,7 +159,39 @@ $artists $composer $comment $ext`
 - If a whole path section becomes empty after omissions, the section is
   dropped entirely (no empty folders).
 
-### path sanitization
+### album & band consolidation
+
+Before paths are built, **band** and **album** values are consolidated so
+that editions/variations of the same name land in one folder. A value `B` is
+*the same as* `A` when `B` starts with `A` and the next character after the
+shared sequence is whitespace — i.e. the shared part ends on a word
+boundary. All members of such a group use the **shortest** member as the
+canonical folder name ("the common characters up to whitespace"):
+
+```
+album
+album (Japanese edition)     →  all →  /band/album/
+album extra
+
+abc          
+abc whatever →  both →  /…/abc/
+
+abc
+abcde        →  DIFFERENT (no whitespace boundary after the shared part)
+```
+
+- applies to **band names and album titles** regardless of source (tags,
+  path inference, overrides); albums are clustered **per band**.
+- rule is order-independent and transitive via the shortest member
+  (`Album Extra (JP)` also folds into `Album` when `Album Extra` does).
+- consolidation affects **path computation only**: `--update-meta` writes
+  each file's own normalized values (edition information is never erased
+  from tags).
+- two different files that consolidate to the same destination are handled
+  by the normal conflict rules below (identical content dedups, different
+  content gets `-1` suffixes).
+
+## path sanitization
 
 After normalization, each path segment is made safe for all platforms:
 
@@ -203,11 +235,18 @@ After normalization, each path segment is made safe for all platforms:
 
 ## album art
 
-- Separate image files (`jpg jpeg png gif webp bmp`) carry no tags; they are
-  moved/copied into the album directory resolved from their path (artist/album
-  inferred from their location, plus overrides), keeping their original file
-  name (only sanitized — no title-casing of e.g. `folder.jpg`).
-- If the album cannot be determined → left alone, reported.
+- Album art has no tags of its own, so its destination is **aligned with the
+  audio files it sits next to**: art in a source folder that contains
+  processable audio is placed into the same resolved album directory those
+  audio files get (the most common destination directory in that folder,
+  ties broken lexicographically). This guarantees art and its album's songs
+  always end up together, even when the songs are placed from their tags
+  rather than from the folder structure.
+- Fallback (no processable audio in the folder): destination is derived from
+  the art file's own path (artist/album inferred from its location, plus
+  overrides), keeping its original file name (only sanitized — no
+  title-casing of e.g. `folder.jpg`).
+- If neither route can determine the album → left alone, reported.
 - Subject to the same conflict rule (e.g. two different `cover.jpg` in one
   album → `cover-1.jpg`).
 
@@ -303,6 +342,18 @@ Exit codes:
 | 0 | success — no errors, nothing left unprocessed |
 | 1 | run completed but some files were unprocessed / per-file errors occurred |
 | 2 | fatal error (bad arguments, unknown template variable, input missing, input/output overlap) |
+
+## progress indication
+
+Two progress bars are drawn while the run is in progress:
+
+1. **map building** — shown while the input is loaded and the in→out map is
+   formed (metadata loading, then destination/conflict resolution);
+2. **execution** — shown while files are actually moved/copied.
+
+Bars are rendered on **stderr** and only when stderr is a terminal — piped
+output, redirected logs and the line report itself stay clean. The final
+report is unaffected by progress output.
 
 ## operational mode
 
